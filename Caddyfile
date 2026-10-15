@@ -1,0 +1,14 @@
+{
+    auto_https disable_redirects
+    default_sni {$PUBLIC_DOMAIN}
+}
+
+{$PUBLIC_DOMAIN} {
+    tls {
+        issuer acme {
+            profile shortlived
+            disable_http_challenge
+        }
+    }
+    reverse_proxy app:8000
+}

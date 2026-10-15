@@ -1,0 +1,88 @@
+services:
+  db:
+    image: postgres:18.6-bookworm
+    restart: unless-stopped
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        cat > /docker-entrypoint-initdb.d/10-schoolbot.sql <<'SQL'
+        \getenv app_user APP_DB_USER
+        \getenv app_password APP_DB_PASSWORD
+        \getenv app_db APP_DB_NAME
+        SELECT format('CREATE ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT PASSWORD %L', :'app_user', :'app_password') \gexec
+        SELECT format('CREATE DATABASE %I OWNER %I', :'app_db', :'app_user') \gexec
+        SQL
+        exec docker-entrypoint.sh postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?Set a separate PostgreSQL admin password}
+      POSTGRES_DB: postgres
+      APP_DB_USER: ${POSTGRES_USER:?Set the unprivileged application role}
+      APP_DB_PASSWORD: ${POSTGRES_PASSWORD:?Set the application password}
+      APP_DB_NAME: ${POSTGRES_DB:-schoolbot}
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U postgres -d postgres']
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  app:
+    build: .
+    restart: unless-stopped
+    init: true
+    ports:
+      - '72:8000'
+    environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8000
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-schoolbot}
+      MAX_API_URL: ${MAX_API_URL:-https://platform-api2.max.ru}
+      MAX_BOT_TOKEN: ${MAX_BOT_TOKEN:-}
+      MAX_TOKEN_CONFIRMED: ${MAX_TOKEN_CONFIRMED:-false}
+      MAX_CA_BUNDLE: /opt/max-ca.pem
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?Set WEBHOOK_SECRET}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      DIRECTOR_CHAT_ID: ${DIRECTOR_CHAT_ID:-0}
+      DIRECTOR_USER_ID: ${DIRECTOR_USER_ID:-}
+      DIRECTOR_DELIVERY_ENABLED: ${DIRECTOR_DELIVERY_ENABLED:-false}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Moscow}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PHOTO_DIR: /app/private/photos
+      PHOTO_MAX_BYTES: ${PHOTO_MAX_BYTES:-10485760}
+      PHOTO_ALLOWED_HOSTS: ${PHOTO_ALLOWED_HOSTS:-max.ru,i.oneme.ru,iu.oneme.ru,okcdn.ru,mycdn.me,userapi.com}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - photos:/app/private/photos
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:-localhost}
+    ports:
+      - '443:443'
+      - '443:443/udp'
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+volumes:
+  postgres_data:
+  photos:
+  caddy_data:
+  caddy_config:

@@ -189,6 +189,7 @@ class Repair(Base):
     rejection_reason: Mapped[str | None] = mapped_column(Text)
     director_user_id: Mapped[int | None] = mapped_column(BigInteger)
     director_message_id: Mapped[str | None] = mapped_column(String(256))
+    director_viewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -331,11 +332,11 @@ def safe_error(exc):
     return type(exc).__name__[:80]
 
 
-SCHEMA_VERSION = "0001_initial"
+SCHEMA_VERSION = "0002_director_viewed"
 
 
 async def migrate(db):
-    # Keep the existing Alembic revision and table; never stamp an unknown schema.
+    # Keep known revisions upgradeable; never stamp an unknown schema.
     async with db.engine.begin() as connection:
         await connection.execute(
             text("SELECT pg_advisory_xact_lock(hashtextextended('schoolbot:migrations', 0))")
@@ -350,6 +351,15 @@ async def migrate(db):
             )
         if versions == [SCHEMA_VERSION]:
             return False
+        if versions == ["0001_initial"]:
+            await connection.execute(
+                text("ALTER TABLE repairs ADD COLUMN director_viewed_at TIMESTAMPTZ NULL")
+            )
+            await connection.execute(
+                text("UPDATE alembic_version SET version_num = :version"),
+                {"version": SCHEMA_VERSION},
+            )
+            return True
         if versions or set(Base.metadata.tables).intersection(tables):
             raise ValueError("Unknown database revision; no schema changes performed")
         await connection.run_sync(Base.metadata.create_all)

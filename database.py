@@ -292,7 +292,7 @@ async def enqueue(
     )
 
 
-async def next_job(session, model):
+async def next_job(session, model, *, answer_only=None):
     older = aliased(model)
     incoming = model is IncomingEvent
     same_user = (
@@ -309,12 +309,14 @@ async def next_job(session, model):
     unblocked = ~exists(select(older.id).where(*blocking))
     priority = [] if incoming else [model.kind != "answer"]
     eligible = unblocked if incoming else or_(model.kind == "answer", unblocked)
+    lane = [] if incoming or answer_only is None else [(model.kind == "answer") == answer_only]
     return await session.scalar(
         select(model)
         .where(
             model.status == "pending",
             model.next_retry_at <= now(),
             eligible,
+            *lane,
         )
         .order_by(*priority, model.id)
         .with_for_update(skip_locked=True)

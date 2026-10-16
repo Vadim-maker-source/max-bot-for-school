@@ -41,9 +41,12 @@ def tls_context(settings: Settings):
 class MaxClient:
     def __init__(self, settings: Settings, transport=None):
         self.settings = settings
+        self.request_lock = asyncio.Lock()
+        self.next_request = 0
         self.http = httpx.AsyncClient(
             base_url=settings.max_api_url,
             timeout=httpx.Timeout(25, connect=10),
+            limits=httpx.Limits(keepalive_expiry=60),
             headers={"Authorization": settings.max_bot_token.get_secret_value()},
             verify=tls_context(settings),
             follow_redirects=False,
@@ -77,6 +80,10 @@ class MaxClient:
     async def request(self, method, path, **kwargs):
         if not self.settings.api_enabled:
             raise MaxError(0, 60, "token_not_configured")
+        async with self.request_lock:
+            loop = asyncio.get_running_loop()
+            await asyncio.sleep(max(0, self.next_request - loop.time()))
+            self.next_request = loop.time() + 1 / 30
         return self.checked(await self.http.request(method, path, **kwargs))
 
     async def send(self, body, *, chat_id=None, user_id=None):

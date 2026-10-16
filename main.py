@@ -4,6 +4,7 @@ import logging
 import random
 from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
+from functools import partial
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -117,10 +118,10 @@ async def message_body(payload, photo, cache, client, photos):
 
 
 async def deliver(session, item, cache, settings, client, photos):
+    repair = None
     if item.kind == "answer":
-        await client.answer(**item.payload)
-        return None
-    if item.kind in ("director_card", "director_sync"):
+        body = None
+    elif item.kind in ("director_card", "director_sync"):
         director = await session.scalar(
             select(User).where(User.max_user_id == settings.director_user_id)
         )
@@ -150,30 +151,43 @@ async def deliver(session, item, cache, settings, client, photos):
             client,
             photos,
         )
-        if item.kind == "director_sync":
-            if not repair.director_message_id:
-                raise DeliveryNotEnabled()
-            await client.edit(repair.director_message_id, body)
-            return repair.director_message_id
-        repair.director_message_id = await client.send(body, chat_id=item.recipient_chat_id)
+        if item.kind == "director_sync" and not repair.director_message_id:
+            raise DeliveryNotEnabled()
+    else:
+        body = await message_body(item.payload, item.payload.get("_photo"), cache, client, photos)
+    # Uploads must not hold the dialog's send lock and delay callback acknowledgements.
+    if not await throttle(session, item):
+        return False
+    if item.kind == "answer":
+        await client.answer(**item.payload)
+        return None
+    if item.kind == "director_sync":
+        await client.edit(repair.director_message_id, body)
         return repair.director_message_id
-    body = await message_body(item.payload, item.payload.get("_photo"), cache, client, photos)
-    return await client.send(body, chat_id=item.recipient_chat_id, user_id=item.recipient_user_id)
+    recipient = {"chat_id": item.recipient_chat_id}
+    if not repair:
+        recipient["user_id"] = item.recipient_user_id
+    mid = await client.send(body, **recipient)
+    if repair:
+        repair.director_message_id = mid
+    return mid
 
 
-async def deliver_one(db, settings, client, photos):
+async def deliver_one(db, settings, client, photos, *, answer_only=None):
     if not settings.api_enabled:
         return False
     async with db.sessions() as session, session.begin():
-        item = await next_job(session, Outbox)
+        item = await next_job(session, Outbox, answer_only=answer_only)
         if item is None:
             return False
-        if not await throttle(session, item):
-            return True
         cache = dict(item.payload.get("_uploaded_image") or {})
         try:
             async with session.begin_nested():
                 mid = await deliver(session, item, cache, settings, client, photos)
+            if mid is False:
+                if cache:
+                    item.payload = {**item.payload, "_uploaded_image": cache}
+                return True
             item.status, item.sent_message_id, item.sent_at = "sent", mid, now()
             item.payload, item.last_error = {}, None
         except Exception as exc:
@@ -189,15 +203,21 @@ async def deliver_one(db, settings, client, photos):
 
 
 async def worker_loop(db, settings, client, photos):
-    while True:
-        try:
-            received = await process_incoming(db, settings, client, photos)
-            sent = await deliver_one(db, settings, client, photos)
-            if received or sent:
-                continue
-        except Exception as exc:
-            log.error("Worker cycle: %s", safe_error(exc))
-        await asyncio.sleep(0.4)
+    async def run(work):
+        while True:
+            try:
+                if await work():
+                    continue
+            except Exception as exc:
+                log.error("Worker cycle: %s", safe_error(exc))
+            await asyncio.sleep(0.1)
+
+    async with asyncio.TaskGroup() as tasks:
+        tasks.create_task(run(partial(process_incoming, db, settings, client, photos)))
+        for answer_only in (True, False):
+            tasks.create_task(
+                run(partial(deliver_one, db, settings, client, photos, answer_only=answer_only))
+            )
 
 
 def create_app(settings=None, db=None, *, run_worker=True):

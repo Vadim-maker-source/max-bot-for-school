@@ -341,6 +341,7 @@ async def worker_loop(db, settings, client, photos, *, incoming_wake=None, outgo
         log.warning("GigaChat configuration unavailable: %s", safe_error(exc))
     try:
         async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(client.keepalive())
             for _ in range(4):
                 tasks.create_task(
                     run(

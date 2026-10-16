@@ -47,10 +47,11 @@ class MaxClient:
         self.settings = settings
         self.request_lock = asyncio.Lock()
         self.next_request = 0
+        self.last_request = 0
         self.http = httpx.AsyncClient(
             base_url=settings.max_api_url,
             timeout=httpx.Timeout(25, connect=10),
-            limits=httpx.Limits(keepalive_expiry=60),
+            limits=httpx.Limits(keepalive_expiry=300),
             headers={"Authorization": settings.max_bot_token.get_secret_value()},
             verify=tls_context(settings),
             follow_redirects=False,
@@ -58,6 +59,7 @@ class MaxClient:
         )
         self.media = httpx.AsyncClient(
             timeout=30,
+            limits=httpx.Limits(keepalive_expiry=300),
             verify=tls_context(settings),
             follow_redirects=False,
             transport=transport,
@@ -88,16 +90,50 @@ class MaxClient:
             loop = asyncio.get_running_loop()
             await asyncio.sleep(max(0, self.next_request - loop.time()))
             self.next_request = loop.time() + 1 / 30
-        started = perf_counter()
-        response = await self.http.request(method, path, **kwargs)
+        starts, network = {}, {}
+
+        async def trace(name, info):
+            phase, _, stage = name.rpartition(".")
+            if phase in ("connection.connect_tcp", "connection.start_tls"):
+                if stage == "started":
+                    starts[phase] = perf_counter()
+                elif stage == "complete" and phase in starts:
+                    network[phase] = (perf_counter() - starts[phase]) * 1000
+
+        extensions = {**kwargs.pop("extensions", {})}
+        extensions.setdefault("trace", trace)
+        started = self.last_request = perf_counter()
+        try:
+            response = await self.http.request(method, path, extensions=extensions, **kwargs)
+        finally:
+            self.last_request = perf_counter()
         log.info(
-            "MAX %s %s: status=%s elapsed_ms=%.0f",
+            "MAX %s %s: status=%s elapsed_ms=%.0f tcp_ms=%.0f tls_ms=%.0f",
             method,
             path,
             response.status_code,
             (perf_counter() - started) * 1000,
+            network.get("connection.connect_tcp", 0),
+            network.get("connection.start_tls", 0),
         )
         return self.checked(response)
+
+    async def keepalive(self, interval=20):
+        delay = 0
+        while self.settings.api_enabled:
+            await asyncio.sleep(delay)
+            idle = perf_counter() - self.last_request
+            if idle < interval:
+                delay = interval - idle
+                continue
+            try:
+                async with asyncio.timeout(5):
+                    await self.request("GET", "/me", timeout=httpx.Timeout(5, connect=3))
+            except (TimeoutError, httpx.HTTPError, MaxError) as exc:
+                delay = max(interval, getattr(exc, "retry_after", 0))
+                log.warning("MAX keepalive: %s", type(exc).__name__)
+            else:
+                delay = interval
 
     async def send(self, body, *, chat_id=None, user_id=None):
         if (chat_id is None) == (user_id is None):

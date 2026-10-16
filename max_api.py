@@ -4,6 +4,7 @@ import hashlib
 import io
 import ipaddress
 import json
+import logging
 import mimetypes
 import os
 import shutil
@@ -12,6 +13,7 @@ import ssl
 import subprocess
 import warnings
 from pathlib import Path
+from time import perf_counter
 from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
 
@@ -21,6 +23,8 @@ from dotenv import set_key
 from PIL import Image, UnidentifiedImageError
 
 from database import ROOT, Settings, get_settings
+
+log = logging.getLogger(__name__)
 
 
 class MaxError(Exception):
@@ -84,7 +88,16 @@ class MaxClient:
             loop = asyncio.get_running_loop()
             await asyncio.sleep(max(0, self.next_request - loop.time()))
             self.next_request = loop.time() + 1 / 30
-        return self.checked(await self.http.request(method, path, **kwargs))
+        started = perf_counter()
+        response = await self.http.request(method, path, **kwargs)
+        log.info(
+            "MAX %s %s: status=%s elapsed_ms=%.0f",
+            method,
+            path,
+            response.status_code,
+            (perf_counter() - started) * 1000,
+        )
+        return self.checked(response)
 
     async def send(self, body, *, chat_id=None, user_id=None):
         if (chat_id is None) == (user_id is None):

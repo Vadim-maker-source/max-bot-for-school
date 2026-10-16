@@ -5,6 +5,7 @@ import random
 from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
 from functools import partial
+from time import perf_counter
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -60,6 +61,11 @@ async def process_incoming(db, settings, client, photos):
                     session.add(ProcessedEvent(idempotency_key=item.idempotency_key))
                     await session.flush()
             item.status, item.payload, item.last_error = "processed", None, None
+            log.info(
+                "Inbox %s processed: age_ms=%.0f",
+                item.id,
+                (now() - item.created_at).total_seconds() * 1000,
+            )
         except Exception as exc:
             retry_job(item, exc)
         return True
@@ -181,6 +187,7 @@ async def deliver_one(db, settings, client, photos, *, answer_only=None):
         item = await next_job(session, Outbox, answer_only=answer_only)
         if item is None:
             return False
+        started = perf_counter()
         cache = dict(item.payload.get("_uploaded_image") or {})
         try:
             async with session.begin_nested():
@@ -191,6 +198,13 @@ async def deliver_one(db, settings, client, photos, *, answer_only=None):
                 return True
             item.status, item.sent_message_id, item.sent_at = "sent", mid, now()
             item.payload, item.last_error = {}, None
+            log.info(
+                "Outbox %s %s sent: work_ms=%.0f age_ms=%.0f",
+                item.id,
+                item.kind,
+                (perf_counter() - started) * 1000,
+                (item.sent_at - item.created_at).total_seconds() * 1000,
+            )
         except Exception as exc:
             if (
                 isinstance(exc, MaxError)
@@ -280,6 +294,7 @@ def create_app(settings=None, db=None, *, run_worker=True):
 
     @app.post("/webhook")
     async def webhook(request: Request):
+        received_at = now()
         if not verify_webhook(request.headers.get("X-Max-Bot-Api-Secret"), settings):
             raise HTTPException(403, "Forbidden")
         body = bytearray()
@@ -305,6 +320,20 @@ def create_app(settings=None, db=None, *, run_worker=True):
                 )
         except Exception:
             raise HTTPException(503, "Storage unavailable") from None
+        timestamp = (raw.get("callback") or {}).get("timestamp", raw.get("timestamp"))
+        age_ms = None
+        if isinstance(timestamp, (int, float)) and 10**8 < timestamp < 10**14:
+            timestamp = timestamp / 1000 if timestamp > 10**11 else timestamp
+            age = received_at.timestamp() - timestamp
+            if -300 <= age <= 7 * 86400:
+                age_ms = round(age * 1000)
+        log.info(
+            "Webhook %s %s: origin_age_ms=%s store_ms=%.0f",
+            event["kind"],
+            event["key"][:12],
+            age_ms,
+            (now() - received_at).total_seconds() * 1000,
+        )
         return {"ok": True}
 
     return app

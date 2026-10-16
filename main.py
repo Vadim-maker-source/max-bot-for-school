@@ -243,6 +243,7 @@ async def worker_loop(db, settings, client, photos):
                 )
             if giga and giga.http:
                 tasks.create_task(run(partial(index_one, db, giga), interval=5))
+            log.info("Bot workers started")
     finally:
         if giga:
             await giga.close()

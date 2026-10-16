@@ -416,7 +416,9 @@ async def next_job(session, model, *, answer_only=None):
 
 
 def configure_logging(level="INFO"):
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.basicConfig(
+        level=level, format="%(asctime)s %(levelname)s %(name)s %(message)s", force=True
+    )
     for name in ("httpx", "httpcore", "sqlalchemy.engine", "sqlalchemy.pool"):
         logging.getLogger(name).setLevel(logging.CRITICAL)
 

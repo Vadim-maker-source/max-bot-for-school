@@ -23,7 +23,7 @@ PROMPTS = {
 }
 STATUS = {
     "new": "🆕 Новая",
-    "pending": "🕓 Не выполнено",
+    "pending": "🕓 Заявка принята",
     "done": "✅ Выполнено",
     "rejected": "❌ Отклонено",
 }
@@ -115,7 +115,7 @@ async def repair_list(session, send, page=0, year=None, month=None):
         lines = [f"📊 Заявки за {MONTHS[month - 1].lower()} {year}", f"Всего: {total}"]
         for status, label in (
             ("done", "✅ Выполнено"),
-            ("pending", "🕓 Не выполнено"),
+            ("pending", STATUS["pending"]),
             ("new", "🆕 Новые"),
             ("rejected", "❌ Отклонено"),
         ):
@@ -409,7 +409,7 @@ async def transition(session, repair, status, director_id, settings, reason=None
     author = await session.get(User, repair.author_id)
     messages = {
         "done": f"✅ Заявка №{repair.id} выполнена",
-        "pending": f"🕓 Заявка №{repair.id} пока не выполнена",
+        "pending": f"🕓 Заявка №{repair.id} принята. Ожидайте выполнения.",
         "rejected": f"❌ Заявка №{repair.id} отклонена.\nПричина: {reason}",
     }
     await enqueue(
@@ -650,7 +650,7 @@ def director_card(repair, author, timezone):
         text += f"\nПричина отклонения: {repair.rejection_reason}"
     buttons = []
     if repair.status not in ("done", "rejected"):
-        actions = {"done": "✅ Выполнено", "pending": "🕓 Не выполнено", "reject": "❌ Отклонить"}
+        actions = {"done": "✅ Выполнено", "pending": STATUS["pending"], "reject": "❌ Отклонить"}
         rows = [[(label, f"admin:{action}:{repair.id}")] for action, label in actions.items()]
         buttons = [keyboard(rows)]
     return {"text": text, "attachments": buttons}

@@ -7,9 +7,9 @@ from datetime import timedelta
 from functools import partial
 from time import perf_counter
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 
 from bot import director_card, parse_update, route, verify_webhook
@@ -49,9 +49,9 @@ def retry_job(item, exc):
     log.warning("%s %s attempt %s: %s", item.__tablename__, item.id, item.attempts, item.last_error)
 
 
-async def process_incoming(db, settings, client, photos):
+async def process_incoming(db, settings, client, photos, *, event_key=None, direct_until=None):
     async with db.sessions() as session, session.begin():
-        item = await next_job(session, IncomingEvent)
+        item = await next_job(session, IncomingEvent, key=event_key)
         if item is None:
             return False
         try:
@@ -60,6 +60,12 @@ async def process_incoming(db, settings, client, photos):
                     await route(session, parse_update(item.payload), settings, photos)
                     session.add(ProcessedEvent(idempotency_key=item.idempotency_key))
                     await session.flush()
+            if direct_until:
+                await session.execute(
+                    update(Outbox)
+                    .where(Outbox.dedup_key == f"answer:{event_key}", Outbox.status == "pending")
+                    .values(next_retry_at=direct_until)
+                )
             item.status, item.payload, item.last_error = "processed", None, None
             log.info(
                 "Inbox %s processed: age_ms=%.0f",
@@ -188,11 +194,11 @@ async def deliver(session, item, cache, settings, client, photos):
     return mid
 
 
-async def deliver_one(db, settings, client, photos, *, answer_only=None):
+async def deliver_one(db, settings, client, photos, *, answer_only=None, event_key=None):
     if not settings.api_enabled:
         return False
     async with db.sessions() as session, session.begin():
-        item = await next_job(session, Outbox, answer_only=answer_only)
+        item = await next_job(session, Outbox, answer_only=answer_only, key=event_key)
         if item is None:
             return False
         started = perf_counter()
@@ -238,11 +244,56 @@ async def deliver_one(db, settings, client, photos, *, answer_only=None):
         return True
 
 
-async def worker_loop(db, settings, client, photos, *, incoming_wake=None):
+async def respond_callback(app, event_key, direct_until):
+    state = app.state
+    started = perf_counter()
+    try:
+        async with asyncio.timeout(4):
+            await process_incoming(
+                state.db,
+                state.settings,
+                state.client,
+                state.photos,
+                event_key=event_key,
+                direct_until=direct_until,
+            )
+            await deliver_one(
+                state.db,
+                state.settings,
+                state.client,
+                state.photos,
+                answer_only=True,
+                event_key=f"answer:{event_key}",
+            )
+    except Exception as exc:
+        log.warning("Direct callback %s: %s", event_key[:12], safe_error(exc))
+    finally:
+        try:
+            async with state.db.sessions() as session, session.begin():
+                for model, match in (
+                    (IncomingEvent, IncomingEvent.idempotency_key == event_key),
+                    (Outbox, Outbox.dedup_key == f"answer:{event_key}"),
+                ):
+                    await session.execute(
+                        update(model)
+                        .where(
+                            match, model.status == "pending", model.next_retry_at == direct_until
+                        )
+                        .values(next_retry_at=now())
+                    )
+        except Exception as exc:
+            log.warning("Callback recovery: %s", safe_error(exc))
+        state.incoming_wake.set()
+        for wake in state.outgoing_wakes:
+            wake.set()
+    log.info("Callback %s direct_ms=%.0f", event_key[:12], (perf_counter() - started) * 1000)
+
+
+async def worker_loop(db, settings, client, photos, *, incoming_wake=None, outgoing_wakes=None):
     from lostfound import index_one
 
     incoming_wake = incoming_wake or asyncio.Event()
-    answer_wake, message_wake = asyncio.Event(), asyncio.Event()
+    answer_wake, message_wake = outgoing_wakes or (asyncio.Event(), asyncio.Event())
 
     async def run(work, wake, notify=(), interval=0.1):
         delay = interval
@@ -309,19 +360,22 @@ def create_app(settings=None, db=None, *, run_worker=True):
         configure_logging(settings.log_level)
         app.state.settings, app.state.db = settings, db or Database(settings)
         app.state.incoming_wake = asyncio.Event()
+        app.state.outgoing_wakes = (asyncio.Event(), asyncio.Event())
         client, task = None, None
         try:
             if db is None:
                 await migrate(app.state.db)
             if run_worker:
-                client = MaxClient(settings)
+                client = app.state.client = MaxClient(settings)
+                app.state.photos = PhotoStore(settings, client.media)
                 task = asyncio.create_task(
                     worker_loop(
                         app.state.db,
                         settings,
                         client,
-                        PhotoStore(settings, client.media),
+                        app.state.photos,
                         incoming_wake=app.state.incoming_wake,
+                        outgoing_wakes=app.state.outgoing_wakes,
                     )
                 )
             yield
@@ -353,7 +407,7 @@ def create_app(settings=None, db=None, *, run_worker=True):
         return JSONResponse({"status": "not_ready"}, status_code=503)
 
     @app.post("/webhook")
-    async def webhook(request: Request):
+    async def webhook(request: Request, background_tasks: BackgroundTasks):
         received_at = now()
         if not verify_webhook(request.headers.get("X-Max-Bot-Api-Secret"), settings):
             raise HTTPException(403, "Forbidden")
@@ -367,20 +421,27 @@ def create_app(settings=None, db=None, *, run_worker=True):
             event = parse_update(raw)
         except (ValueError, KeyError, TypeError, AttributeError):
             raise HTTPException(400, "Invalid MAX update") from None
+        direct = run_worker and settings.api_enabled and event["kind"] == "message_callback"
+        direct_until = now() + timedelta(seconds=5) if direct else now()
         try:
             async with app.state.db.sessions() as session, session.begin():
-                await session.execute(
+                inserted = await session.scalar(
                     insert(IncomingEvent)
                     .values(
                         idempotency_key=event["key"],
                         actor_id=event["user_id"],
                         payload=raw,
+                        next_retry_at=direct_until,
                     )
                     .on_conflict_do_nothing(index_elements=["idempotency_key"])
+                    .returning(IncomingEvent.id)
                 )
         except Exception:
             raise HTTPException(503, "Storage unavailable") from None
-        app.state.incoming_wake.set()
+        if direct and inserted is not None:
+            background_tasks.add_task(respond_callback, app, event["key"], direct_until)
+        else:
+            app.state.incoming_wake.set()
         timestamp = (raw.get("callback") or {}).get("timestamp", raw.get("timestamp"))
         age_ms = None
         if isinstance(timestamp, (int, float)) and 10**8 < timestamp < 10**14:

@@ -123,6 +123,11 @@ class MaxClient:
         )
         if data.get("success") is not True:
             raise MaxError(200, code="answer_not_confirmed")
+        log.info(
+            "Callback %s accepted: mode=%s",
+            hashlib.sha256(("callback:" + callback_id).encode()).hexdigest()[:12],
+            "update" if message is not None else "notice",
+        )
 
     async def edit(self, message_id, body):
         data = await self.request("PUT", "/messages", params={"message_id": message_id}, json=body)

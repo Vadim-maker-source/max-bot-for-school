@@ -383,7 +383,7 @@ async def enqueue(
     )
 
 
-async def next_job(session, model, *, answer_only=None):
+async def next_job(session, model, *, answer_only=None, key=None):
     older = aliased(model)
     incoming = model is IncomingEvent
     same_user = (
@@ -400,11 +400,12 @@ async def next_job(session, model, *, answer_only=None):
     unblocked = ~exists(select(older.id).where(*blocking))
     priority = [] if incoming else [model.kind != "answer"]
     lane = [] if incoming or answer_only is None else [(model.kind == "answer") == answer_only]
+    identity = model.idempotency_key if incoming else model.dedup_key
     return await session.scalar(
         select(model)
         .where(
             model.status == "pending",
-            model.next_retry_at <= now(),
+            model.next_retry_at <= now() if key is None else identity == key,
             unblocked,
             *lane,
         )

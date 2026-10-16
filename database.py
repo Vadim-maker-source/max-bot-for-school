@@ -396,17 +396,16 @@ async def next_job(session, model, *, answer_only=None):
     )
     blocking = [older.status == "pending", older.id < model.id, same_user]
     if not incoming:
-        blocking.append(older.kind != "answer")
+        blocking.append((older.kind == "answer") == (model.kind == "answer"))
     unblocked = ~exists(select(older.id).where(*blocking))
     priority = [] if incoming else [model.kind != "answer"]
-    eligible = unblocked if incoming else or_(model.kind == "answer", unblocked)
     lane = [] if incoming or answer_only is None else [(model.kind == "answer") == answer_only]
     return await session.scalar(
         select(model)
         .where(
             model.status == "pending",
             model.next_retry_at <= now(),
-            eligible,
+            unblocked,
             *lane,
         )
         .order_by(*priority, model.id)

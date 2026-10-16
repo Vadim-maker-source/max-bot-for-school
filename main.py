@@ -118,8 +118,12 @@ async def message_body(payload, photo, cache, client, photos):
         if cache.get("checksum") != photo["checksum"] or not cache.get("payload"):
             cache.update(
                 checksum=photo["checksum"],
-                payload=await client.upload_image(path, photo["media_metadata"]["mime"]),
+                payload=photos.uploaded_images.get(photo["checksum"])
+                or await client.upload_image(path, photo["media_metadata"]["mime"]),
             )
+        photos.uploaded_images[photo["checksum"]] = cache["payload"]
+        if len(photos.uploaded_images) > 128:
+            photos.uploaded_images.pop(next(iter(photos.uploaded_images)))
         body["attachments"] = [{"type": "image", "payload": cache["payload"]}] + body.get(
             "attachments", []
         )
@@ -168,7 +172,9 @@ async def deliver(session, item, cache, settings, client, photos):
     if not await throttle(session, item):
         return False
     if item.kind == "answer":
-        await client.answer(**item.payload)
+        await client.answer(
+            **{key: value for key, value in item.payload.items() if not key.startswith("_")}
+        )
         return None
     if item.kind == "director_sync":
         await client.edit(repair.director_message_id, body)
@@ -209,27 +215,53 @@ async def deliver_one(db, settings, client, photos, *, answer_only=None):
             )
         except Exception as exc:
             if (
+                item.kind == "answer"
+                and isinstance(exc, MaxError)
+                and exc.status in (400, 404, 410)
+            ):
+                item.kind = "message"
+                item.payload = item.payload.get("message") or {
+                    "text": item.payload.get("notification") or "Откройте меню командой /start"
+                }
+                item.next_retry_at, item.last_error = now(), safe_error(exc)
+                log.warning("Callback %s unavailable: HTTP %s", item.id, exc.status)
+                return True
+            if (
                 isinstance(exc, MaxError)
                 and exc.status == 400
                 and exc.code != "attachment.not.ready"
             ):
+                photos.uploaded_images.pop(cache.get("checksum"), None)
                 cache = {}
             item.payload = {**item.payload, "_uploaded_image": cache}
             retry_job(item, exc)
         return True
 
 
-async def worker_loop(db, settings, client, photos):
+async def worker_loop(db, settings, client, photos, *, incoming_wake=None):
     from lostfound import index_one
 
-    async def run(work, interval=0.1):
+    incoming_wake = incoming_wake or asyncio.Event()
+    answer_wake, message_wake = asyncio.Event(), asyncio.Event()
+
+    async def run(work, wake, notify=(), interval=0.1):
+        delay = interval
         while True:
+            wake.clear()
             try:
                 if await work():
+                    wake.set()
+                    for event in notify:
+                        event.set()
+                    delay = interval
                     continue
             except Exception as exc:
                 log.error("Worker cycle: %s", safe_error(exc))
-            await asyncio.sleep(interval)
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=delay)
+                delay = interval
+            except TimeoutError:
+                delay = min(max(1, interval), delay * 2)
 
     giga = None
     try:
@@ -238,13 +270,31 @@ async def worker_loop(db, settings, client, photos):
         log.warning("GigaChat configuration unavailable: %s", safe_error(exc))
     try:
         async with asyncio.TaskGroup() as tasks:
-            tasks.create_task(run(partial(process_incoming, db, settings, client, photos)))
-            for answer_only in (True, False):
+            for _ in range(4):
                 tasks.create_task(
-                    run(partial(deliver_one, db, settings, client, photos, answer_only=answer_only))
+                    run(
+                        partial(process_incoming, db, settings, client, photos),
+                        incoming_wake,
+                        notify=(answer_wake, message_wake),
+                    )
                 )
+            for answer_only, wake in ((True, answer_wake), (False, message_wake)):
+                for _ in range(4):
+                    tasks.create_task(
+                        run(
+                            partial(
+                                deliver_one,
+                                db,
+                                settings,
+                                client,
+                                photos,
+                                answer_only=answer_only,
+                            ),
+                            wake,
+                        )
+                    )
             if giga and giga.http:
-                tasks.create_task(run(partial(index_one, db, giga), interval=5))
+                tasks.create_task(run(partial(index_one, db, giga), asyncio.Event(), interval=5))
             log.info("Bot workers started")
     finally:
         if giga:
@@ -258,6 +308,7 @@ def create_app(settings=None, db=None, *, run_worker=True):
     async def lifespan(app):
         configure_logging(settings.log_level)
         app.state.settings, app.state.db = settings, db or Database(settings)
+        app.state.incoming_wake = asyncio.Event()
         client, task = None, None
         try:
             if db is None:
@@ -265,7 +316,13 @@ def create_app(settings=None, db=None, *, run_worker=True):
             if run_worker:
                 client = MaxClient(settings)
                 task = asyncio.create_task(
-                    worker_loop(app.state.db, settings, client, PhotoStore(settings, client.media))
+                    worker_loop(
+                        app.state.db,
+                        settings,
+                        client,
+                        PhotoStore(settings, client.media),
+                        incoming_wake=app.state.incoming_wake,
+                    )
                 )
             yield
         finally:
@@ -323,6 +380,7 @@ def create_app(settings=None, db=None, *, run_worker=True):
                 )
         except Exception:
             raise HTTPException(503, "Storage unavailable") from None
+        app.state.incoming_wake.set()
         timestamp = (raw.get("callback") or {}).get("timestamp", raw.get("timestamp"))
         age_ms = None
         if isinstance(timestamp, (int, float)) and 10**8 < timestamp < 10**14:

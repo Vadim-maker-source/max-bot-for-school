@@ -304,22 +304,27 @@ def parse_update(raw):
 
 
 async def reply(session, event, text=None, buttons=None, photo=None, *, answer=None):
-    if answer and event["callback_id"]:
+    body = {"text": text, "attachments": [buttons] if buttons else []}
+    if event["callback_id"]:
+        payload = {"callback_id": event["callback_id"]}
+        if text is not None and not photo and event["message_id"]:
+            payload["message"] = body
+        else:
+            payload["notification"] = answer or "Принято"
         await enqueue(
             session,
             key=f"answer:{event['key']}",
             kind="answer",
             user_id=event["user_id"],
-            payload={"callback_id": event["callback_id"], "notification": answer},
+            payload=payload,
         )
+        if "message" in payload:
+            return
     if text is not None:
-        payload = {"text": text}
-        if buttons:
-            payload["attachments"] = [buttons]
         if photo:
-            payload["_photo"] = photo
+            body["_photo"] = photo
         await enqueue(
-            session, key=f"event:{event['key']}:1", user_id=event["user_id"], payload=payload
+            session, key=f"event:{event['key']}:1", user_id=event["user_id"], payload=body
         )
 
 

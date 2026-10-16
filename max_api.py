@@ -109,12 +109,17 @@ class MaxClient:
             raise MaxError(200, code="missing_message_id")
         return str(mid)
 
-    async def answer(self, callback_id, notification="Принято"):
+    async def answer(self, callback_id, notification=None, message=None):
+        body = {}
+        if notification:
+            body["notification"] = notification
+        if message is not None:
+            body["message"] = message
         data = await self.request(
             "POST",
             "/answers",
             params={"callback_id": callback_id},
-            json={"notification": notification},
+            json=body,
         )
         if data.get("success") is not True:
             raise MaxError(200, code="answer_not_confirmed")
@@ -178,6 +183,7 @@ class PhotoStore:
             self.root = ROOT / self.root
         self.root.mkdir(parents=True, exist_ok=True)
         self.media = media
+        self.uploaded_images = {}
 
     def path(self, relative: str) -> Path:
         path = (self.root / relative).resolve()

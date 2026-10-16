@@ -28,6 +28,7 @@ from database import (
     now,
     safe_error,
 )
+from gigachat_api import GigaChat
 from max_api import MaxClient, MaxError, PhotoStore
 
 log = logging.getLogger(__name__)
@@ -203,21 +204,34 @@ async def deliver_one(db, settings, client, photos, *, answer_only=None):
 
 
 async def worker_loop(db, settings, client, photos):
-    async def run(work):
+    from lostfound import index_one
+
+    async def run(work, interval=0.1):
         while True:
             try:
                 if await work():
                     continue
             except Exception as exc:
                 log.error("Worker cycle: %s", safe_error(exc))
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(interval)
 
-    async with asyncio.TaskGroup() as tasks:
-        tasks.create_task(run(partial(process_incoming, db, settings, client, photos)))
-        for answer_only in (True, False):
-            tasks.create_task(
-                run(partial(deliver_one, db, settings, client, photos, answer_only=answer_only))
-            )
+    giga = None
+    try:
+        giga = GigaChat(settings)
+    except (OSError, ValueError) as exc:
+        log.warning("GigaChat configuration unavailable: %s", safe_error(exc))
+    try:
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(run(partial(process_incoming, db, settings, client, photos)))
+            for answer_only in (True, False):
+                tasks.create_task(
+                    run(partial(deliver_one, db, settings, client, photos, answer_only=answer_only))
+                )
+            if giga and giga.http:
+                tasks.create_task(run(partial(index_one, db, giga), interval=5))
+    finally:
+        if giga:
+            await giga.close()
 
 
 def create_app(settings=None, db=None, *, run_worker=True):

@@ -44,6 +44,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, aliased, mapped_column
 
 ROOT = Path(__file__).resolve().parent
 
+# ==================== НАСТРОЙКИ ====================
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -60,6 +62,15 @@ class Settings(BaseSettings):
     director_chat_id: int = 0
     director_user_id: int | None = None
     director_delivery_enabled: bool = False
+    guard_user_id: int | None = None
+    guard_chat_id: int | None = None
+    gigachat_credentials: SecretStr = SecretStr("")
+    gigachat_client_id: str = ""
+    gigachat_client_secret: SecretStr = SecretStr("")
+    gigachat_scope: str = "GIGACHAT_API_PERS"
+    gigachat_model: str = "GigaChat"
+    gigachat_base_url: str = "https://api.giga.chat/v1"
+    gigachat_ca_bundle_file: str = ""
     postgres_host: str = "127.0.0.1"
     postgres_port: int = 5432
     postgres_user: str = "schoolbot_app"
@@ -75,7 +86,7 @@ class Settings(BaseSettings):
     max_ca_bundle: str = ""
     repair_hourly_limit: int = 5
 
-    @field_validator("director_user_id", mode="before")
+    @field_validator("director_user_id", "guard_user_id", "guard_chat_id", mode="before")
     @classmethod
     def blank_id(cls, value):
         return None if value == "" else value
@@ -102,6 +113,20 @@ class Settings(BaseSettings):
         api = urlsplit(self.max_api_url)
         if api.scheme != "https" or not api.hostname:
             raise ValueError("MAX_API_URL must use HTTPS")
+        giga = urlsplit(self.gigachat_base_url)
+        if (
+            giga.scheme != "https"
+            or not giga.hostname
+            or giga.username
+            or giga.query
+            or giga.fragment
+        ):
+            raise ValueError("GIGACHAT_BASE_URL must use HTTPS without credentials or query")
+        if any(
+            value is not None and not 0 < value < 2**63
+            for value in (self.guard_user_id, self.guard_chat_id)
+        ):
+            raise ValueError("GUARD IDs must be positive MAX identifiers")
         if self.webhook_url:
             url = urlsplit(self.webhook_url)
             if (
@@ -160,6 +185,9 @@ class User(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
 
 
+# ==================== МОДЕЛИ ПОЛОМОК ====================
+
+
 class RepairDraft(Base):
     __tablename__ = "repair_drafts"
     __table_args__ = (CheckConstraint("stage IN ('description','photo','location','confirm')"),)
@@ -202,6 +230,69 @@ class RepairPhoto(Base):
     private_path: Mapped[str] = mapped_column(String(256))
     media_metadata: Mapped[dict] = mapped_column(JSONB)
     checksum: Mapped[str] = mapped_column(String(64))
+
+
+# ==================== МОДЕЛИ БЮРО НАХОДОК ====================
+
+
+class FoundItem(Base):
+    __tablename__ = "found_items"
+    __table_args__ = (
+        CheckConstraint("status IN ('stored','issued')"),
+        CheckConstraint("status != 'issued' OR (issued_at IS NOT NULL AND issued_by IS NOT NULL)"),
+        CheckConstraint("char_length(description) BETWEEN 1 AND 120"),
+        Index("ix_found_status_created", "status", "created_at"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    description: Mapped[str] = mapped_column(String(120))
+    photo_ref: Mapped[dict] = mapped_column(JSONB)
+    keywords: Mapped[list] = mapped_column(JSONB, default=list)
+    keywords_for: Mapped[str | None] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(20), default="stored")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_by: Mapped[int] = mapped_column(BigInteger)
+    issued_by: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+    issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_retry_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    last_error: Mapped[str | None] = mapped_column(String(80))
+
+
+class FoundDraft(Base):
+    __tablename__ = "found_drafts"
+    __table_args__ = (CheckConstraint("stage IN ('menu','photo','description','confirm')"),)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.max_user_id"), primary_key=True)
+    stage: Mapped[str] = mapped_column(String(20), default="menu")
+    operation: Mapped[str] = mapped_column(String(20), default="add")
+    item_id: Mapped[int | None] = mapped_column(ForeignKey("found_items.id"))
+    item_version: Mapped[int | None] = mapped_column(Integer)
+    description: Mapped[str | None] = mapped_column(String(120))
+    suggestion: Mapped[str | None] = mapped_column(String(120))
+    photo_ref: Mapped[dict | None] = mapped_column(JSONB)
+    nonce: Mapped[str] = mapped_column(String(32), default=lambda: uuid4().hex)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    paused: Mapped[bool] = mapped_column(Boolean, default=False)
+    searching: Mapped[bool] = mapped_column(Boolean, default=False)
+    query: Mapped[str | None] = mapped_column(String(200))
+    view: Mapped[str] = mapped_column(String(20), default="stored")
+    page: Mapped[int] = mapped_column(Integer, default=0)
+    confirmation: Mapped[dict | None] = mapped_column(JSONB)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
+
+class FoundEvent(Base):
+    __tablename__ = "found_events"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("found_items.id"), index=True)
+    actor_id: Mapped[int] = mapped_column(BigInteger)
+    action: Mapped[str] = mapped_column(String(30))
+    details: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+# ==================== ОЧЕРЕДИ И РАБОТА С БАЗОЙ ====================
 
 
 class Outbox(Base):
@@ -334,7 +425,9 @@ def safe_error(exc):
     return type(exc).__name__[:80]
 
 
-SCHEMA_VERSION = "0002_director_viewed"
+# ==================== МИГРАЦИИ ====================
+
+SCHEMA_VERSION = "0003_lostfound"
 
 
 async def migrate(db):
@@ -357,6 +450,10 @@ async def migrate(db):
             await connection.execute(
                 text("ALTER TABLE repairs ADD COLUMN director_viewed_at TIMESTAMPTZ NULL")
             )
+            versions = ["0002_director_viewed"]
+        if versions == ["0002_director_viewed"]:
+            for model in (FoundItem, FoundDraft, FoundEvent):
+                await connection.run_sync(lambda conn, table=model.__table__: table.create(conn))
             await connection.execute(
                 text("UPDATE alembic_version SET version_num = :version"),
                 {"version": SCHEMA_VERSION},
@@ -428,6 +525,8 @@ async def database_command(settings, args):
             if args.cleanup_unused_photos:
                 refs = set((await session.scalars(select(RepairPhoto.private_path))).all())
                 values = list((await session.scalars(select(RepairDraft.photo_ref))).all())
+                for model in (FoundItem, FoundDraft):
+                    values += list((await session.scalars(select(model.photo_ref))).all())
                 values += [
                     p.get("_photo")
                     for p in (
@@ -526,6 +625,10 @@ def audit():
             "WEBHOOK_SECRET",
             "DIRECTOR_USER_ID",
             "DIRECTOR_CHAT_ID",
+            "GUARD_USER_ID",
+            "GUARD_CHAT_ID",
+            "GIGACHAT_CREDENTIALS",
+            "GIGACHAT_CLIENT_SECRET",
         )
     ]
     ignored = {".venv", ".git", "private", "work", "__pycache__", ".pytest_cache", ".ruff_cache"}

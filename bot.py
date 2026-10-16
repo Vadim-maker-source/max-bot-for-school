@@ -8,10 +8,11 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 
-from database import DirectorDraft, Repair, RepairDraft, RepairPhoto, User, enqueue, now
+from database import DirectorDraft, FoundDraft, Repair, RepairDraft, RepairPhoto, User, enqueue, now
 from max_api import InvalidPhoto
 
 WELCOME = "🏫 Добро пожаловать в школьного помощника!\nВыберите нужный раздел в меню:"
+# ==================== ЗАЯВКИ О ПОЛОМКАХ: ШАГИ И СТАТУСЫ ====================
 STAGES = ("description", "photo", "location", "confirm")
 FIELDS = {"description": "description", "photo": "photo_ref", "location": "location_text"}
 PROMPTS = {
@@ -44,6 +45,9 @@ MONTHS = (
 )
 
 
+# ==================== ГЛАВНОЕ МЕНЮ ====================
+
+
 def keyboard(rows):
     return {
         "type": "inline_keyboard",
@@ -56,7 +60,7 @@ def keyboard(rows):
     }
 
 
-MENU = keyboard([[("🔧 Сообщить о поломке", "repair:start")]])
+MENU = keyboard([[("🔧 Сообщить о поломке", "repair:start")], [("🎒 Бюро находок", "found:menu")]])
 
 
 def is_director(user_id, settings):
@@ -74,8 +78,12 @@ async def main_menu(session, user_id, settings):
             [(f"📥 Новые заявки ({unread})", "director:inbox")],
             [("📅 Архив заявок", "director:archive")],
             [("🔧 Сообщить о поломке", "repair:start")],
+            [("🎒 Бюро находок", "found:menu")],
         ]
     )
+
+
+# ==================== МЕНЮ ДИРЕКТОРА И АРХИВ ====================
 
 
 async def repair_list(session, send, page=0, year=None, month=None):
@@ -313,6 +321,9 @@ async def reply(session, event, text=None, buttons=None, photo=None, *, answer=N
         await enqueue(
             session, key=f"event:{event['key']}:1", user_id=event["user_id"], payload=payload
         )
+
+
+# ==================== ЗАЯВКИ О ПОЛОМКАХ ====================
 
 
 async def show_draft(draft, send, prefix="", answer=None):
@@ -566,7 +577,12 @@ async def draft_message(session, draft, event, send, photos):
     await show_draft(draft, send)
 
 
+# ==================== МАРШРУТИЗАЦИЯ СОБЫТИЙ И БЮРО НАХОДОК ====================
+
+
 async def route(session, event, settings, photos):
+    from lostfound import found_callback, found_message
+
     send = partial(reply, session, event)
     if not event["private"]:
         return await send(answer="Откройте личный диалог с ботом")
@@ -588,6 +604,7 @@ async def route(session, event, settings, photos):
         user.chat_id, user.private_chat_verified = event["chat_id"], True
         user.started_at = user.started_at or now()
     draft = await session.get(RepairDraft, user.id)
+    found = await session.get(FoundDraft, event["user_id"], with_for_update=True)
     admin = (
         await session.get(DirectorDraft, event["user_id"])
         if is_director(event["user_id"], settings)
@@ -604,6 +621,11 @@ async def route(session, event, settings, photos):
         if admin:
             await session.delete(admin)
             suffix += "\nВвод причины отклонения отменён. Статус заявки не изменён."
+        if found:
+            found.searching, found.confirmation = False, None
+            found.paused, found.version = True, found.version + 1
+            if found.stage != "menu":
+                suffix += "\nЧерновик бюро находок сохранён. Продолжить его можно в меню бюро."
         return await send(WELCOME + suffix, await main_menu(session, event["user_id"], settings))
     if event["text"].strip() == "/id":
         user.id_seen_at = now()
@@ -613,6 +635,15 @@ async def route(session, event, settings, photos):
         return await send(text)
     if event["callback_id"]:
         prefix = event["payload"].split(":", 1)[0]
+        if prefix == "found":
+            if admin:
+                return await show_draft(admin, send, answer="Завершите или отмените отклонение")
+            if draft and not draft.paused:
+                draft.paused, draft.version = True, draft.version + 1
+            return await found_callback(session, user, found, event, send, settings, photos)
+        if found and prefix in ("repair", "director", "admin", "reject"):
+            found.paused, found.searching, found.confirmation = True, False, None
+            found.version += 1
         if prefix == "repair" and admin:
             return await show_draft(admin, send, answer="Завершите или отмените отклонение")
         handler = {
@@ -632,6 +663,8 @@ async def route(session, event, settings, photos):
         )
     if admin or (draft and not draft.paused):
         return await draft_message(session, admin or draft, event, send, photos)
+    if found and (found.searching or (found.stage != "menu" and not found.paused)):
+        return await found_message(session, user, found, event, send, settings, photos)
     await send(
         "Выберите действие в меню.\n" + WELCOME,
         await main_menu(session, event["user_id"], settings),

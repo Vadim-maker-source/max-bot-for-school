@@ -72,6 +72,7 @@ async def process_incoming(db, settings, client, photos):
 
 
 async def throttle(session, item):
+    answer = item.kind == "answer"
     if item.recipient_user_id is not None:
         user_id = item.recipient_user_id
         chat_id = await session.scalar(
@@ -89,7 +90,7 @@ async def throttle(session, item):
     key = f"chat:{chat_id}" if chat_id is not None else f"user:{user_id}"
     locked = await session.scalar(
         text("SELECT pg_try_advisory_xact_lock(hashtextextended(:key, 0))"),
-        {"key": "max-rate:" + key},
+        {"key": "max-rate:" + key + (":answer" if answer else ":message")},
     )
     if not locked:
         item.next_retry_at = now() + timedelta(seconds=0.2)
@@ -97,6 +98,7 @@ async def throttle(session, item):
     sent = await session.scalar(
         select(func.max(Outbox.sent_at)).where(
             Outbox.status == "sent",
+            (Outbox.kind == "answer") == answer,
             or_(
                 Outbox.recipient_chat_id == chat_id if chat_id is not None else False,
                 Outbox.recipient_user_id == user_id if user_id is not None else False,

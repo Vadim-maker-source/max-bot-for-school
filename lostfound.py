@@ -690,7 +690,9 @@ async def found_callback(session, user, draft, event, send, settings, photos):
         or draft.paused
         or draft.stage == "menu"
     ):
-        return await send(answer="Кнопка устарела. Продолжите форму из меню бюро находок")
+        if draft.stage != "menu" and not draft.paused:
+            return await show_form(session, draft, send, "Кнопка устарела. Текущий шаг:\n")
+        return await show_menu(draft, send, admin)
     if action == "cancel":
         draft.stage, draft.paused, draft.searching = "menu", False, False
         draft.photo_ref, draft.description, draft.suggestion, draft.confirmation = (

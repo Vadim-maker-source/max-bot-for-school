@@ -9,7 +9,7 @@ from time import perf_counter
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, or_, select, text, update
+from sqlalchemy import or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 
 from bot import director_card, parse_update, route, verify_webhook
@@ -63,7 +63,10 @@ async def process_incoming(db, settings, client, photos, *, event_key=None, dire
             if direct_until:
                 await session.execute(
                     update(Outbox)
-                    .where(Outbox.dedup_key == f"answer:{event_key}", Outbox.status == "pending")
+                    .where(
+                        Outbox.dedup_key.in_((f"answer:{event_key}", f"event:{event_key}:1")),
+                        Outbox.status == "pending",
+                    )
                     .values(next_retry_at=direct_until)
                 )
             item.status, item.payload, item.last_error = "processed", None, None
@@ -101,18 +104,24 @@ async def throttle(session, item):
     if not locked:
         item.next_retry_at = now() + timedelta(seconds=0.2)
         return False
-    sent = await session.scalar(
-        select(func.max(Outbox.sent_at)).where(
-            Outbox.status == "sent",
-            (Outbox.kind == "answer") == answer,
-            or_(
-                Outbox.recipient_chat_id == chat_id if chat_id is not None else False,
-                Outbox.recipient_user_id == user_id if user_id is not None else False,
-            ),
+    sent = list(
+        await session.scalars(
+            select(Outbox.sent_at)
+            .where(
+                Outbox.status == "sent",
+                (Outbox.kind == "answer") == answer,
+                Outbox.sent_at > now() - timedelta(seconds=1),
+                or_(
+                    Outbox.recipient_chat_id == chat_id if chat_id is not None else False,
+                    Outbox.recipient_user_id == user_id if user_id is not None else False,
+                ),
+            )
+            .order_by(Outbox.sent_at.desc())
+            .limit(2)
         )
     )
-    if sent and sent + timedelta(seconds=0.6) > now():
-        item.next_retry_at = sent + timedelta(seconds=0.6)
+    if len(sent) == 2:
+        item.next_retry_at = sent[-1] + timedelta(seconds=1)
         return False
     return True
 
@@ -155,6 +164,8 @@ async def deliver(session, item, cache, settings, client, photos):
         ):
             raise DeliveryNotEnabled()
         repair = await session.get(Repair, item.repair_id, with_for_update=True)
+        if item.kind == "director_sync" and item.created_at < repair.updated_at:
+            return repair.director_message_id
         photo = await session.scalar(select(RepairPhoto).where(RepairPhoto.repair_id == repair.id))
         if not photo:
             raise ValueError("Repair photo missing")
@@ -244,7 +255,8 @@ async def deliver_one(db, settings, client, photos, *, answer_only=None, event_k
         return True
 
 
-async def respond_callback(app, event_key, direct_until):
+async def respond_event(app, event, direct_until):
+    event_key = event["key"]
     state = app.state
     started = perf_counter()
     try:
@@ -257,22 +269,25 @@ async def respond_callback(app, event_key, direct_until):
                 event_key=event_key,
                 direct_until=direct_until,
             )
-            await deliver_one(
-                state.db,
-                state.settings,
-                state.client,
-                state.photos,
-                answer_only=True,
-                event_key=f"answer:{event_key}",
-            )
+            keys = ([f"answer:{event_key}"] if event["callback_id"] else []) + [
+                f"event:{event_key}:1"
+            ]
+            for key in keys:
+                await deliver_one(
+                    state.db,
+                    state.settings,
+                    state.client,
+                    state.photos,
+                    event_key=key,
+                )
     except Exception as exc:
-        log.warning("Direct callback %s: %s", event_key[:12], safe_error(exc))
+        log.warning("Direct event %s: %s", event_key[:12], safe_error(exc))
     finally:
         try:
             async with state.db.sessions() as session, session.begin():
                 for model, match in (
                     (IncomingEvent, IncomingEvent.idempotency_key == event_key),
-                    (Outbox, Outbox.dedup_key == f"answer:{event_key}"),
+                    (Outbox, Outbox.dedup_key.in_((f"answer:{event_key}", f"event:{event_key}:1"))),
                 ):
                     await session.execute(
                         update(model)
@@ -282,11 +297,16 @@ async def respond_callback(app, event_key, direct_until):
                         .values(next_retry_at=now())
                     )
         except Exception as exc:
-            log.warning("Callback recovery: %s", safe_error(exc))
+            log.warning("Event recovery: %s", safe_error(exc))
         state.incoming_wake.set()
         for wake in state.outgoing_wakes:
             wake.set()
-    log.info("Callback %s direct_ms=%.0f", event_key[:12], (perf_counter() - started) * 1000)
+    log.info(
+        "Event %s %s direct_ms=%.0f",
+        event["kind"],
+        event_key[:12],
+        (perf_counter() - started) * 1000,
+    )
 
 
 async def worker_loop(db, settings, client, photos, *, incoming_wake=None, outgoing_wakes=None):
@@ -421,7 +441,7 @@ def create_app(settings=None, db=None, *, run_worker=True):
             event = parse_update(raw)
         except (ValueError, KeyError, TypeError, AttributeError):
             raise HTTPException(400, "Invalid MAX update") from None
-        direct = run_worker and settings.api_enabled and event["kind"] == "message_callback"
+        direct = run_worker and settings.api_enabled
         direct_until = now() + timedelta(seconds=5) if direct else now()
         try:
             async with app.state.db.sessions() as session, session.begin():
@@ -439,7 +459,7 @@ def create_app(settings=None, db=None, *, run_worker=True):
         except Exception:
             raise HTTPException(503, "Storage unavailable") from None
         if direct and inserted is not None:
-            background_tasks.add_task(respond_callback, app, event["key"], direct_until)
+            background_tasks.add_task(respond_event, app, event, direct_until)
         else:
             app.state.incoming_wake.set()
         timestamp = (raw.get("callback") or {}).get("timestamp", raw.get("timestamp"))

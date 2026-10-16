@@ -5,10 +5,20 @@ from datetime import datetime, timedelta
 from functools import partial
 from zoneinfo import ZoneInfo
 
+import httpx
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 
-from database import DirectorDraft, FoundDraft, Repair, RepairDraft, RepairPhoto, User, enqueue, now
+from database import (
+    DirectorDraft,
+    FoundDraft,
+    Repair,
+    RepairDraft,
+    RepairPhoto,
+    User,
+    enqueue,
+    now,
+)
 from max_api import InvalidPhoto
 
 WELCOME = "🏫 Добро пожаловать в школьного помощника!\nВыберите нужный раздел в меню:"
@@ -49,6 +59,12 @@ MONTHS = (
 
 
 def keyboard(rows):
+    actions = {value for row in rows for _, value in row}
+    if (
+        not actions.intersection({"menu", "director:menu", "found:home"})
+        and not {"repair:start", "found:menu"} <= actions
+    ):
+        rows = [*rows, [("🏠 Главное меню", "menu")]]
     return {
         "type": "inline_keyboard",
         "payload": {
@@ -86,7 +102,7 @@ async def main_menu(session, user_id, settings):
 # ==================== МЕНЮ ДИРЕКТОРА И АРХИВ ====================
 
 
-async def repair_list(session, send, page=0, year=None, month=None):
+async def repair_list(session, send, page=0, year=None, month=None, prefix=""):
     if year is None:
         condition = Repair.director_viewed_at.is_(None)
         callback = "director:inbox"
@@ -161,7 +177,7 @@ async def repair_list(session, send, page=0, year=None, month=None):
     if year is not None:
         rows.append([("⬅️ Назад к месяцам", f"director:year:{year}")])
     rows += [[("🔄 Обновить", f"{callback}:{page}")], [("🏠 Главное меню", "director:menu")]]
-    await send("\n\n".join(blocks), keyboard(rows), answer="Список обновлён")
+    await send(prefix + "\n\n".join(blocks), keyboard(rows), answer="Список обновлён")
 
 
 async def director_callback(session, user, draft, event, send, settings):
@@ -216,26 +232,18 @@ async def director_callback(session, user, draft, event, send, settings):
         year, month = numbers[:2]
         return await repair_list(session, send, numbers[2] if len(numbers) == 3 else 0, year, month)
     if action == "open" and len(numbers) in (1, 4) and numbers[0] > 0:
-        back = "director:inbox"
-        if len(numbers) == 4:
-            _, year, month, page = numbers
-            if year == month == 0:
-                back += f":{page}"
-            elif 2026 <= year <= current_year and 1 <= month <= 12:
-                back = f"director:month:{year}:{month}:{page}"
-            else:
-                return await send(answer="Некорректная кнопка")
+        context = numbers[1:] if len(numbers) == 4 else [0, 0, 0]
+        year, month, _ = context
+        if not (year == month == 0 or 2026 <= year <= current_year and 1 <= month <= 12):
+            return await send(answer="Некорректная кнопка")
         repair = await session.get(Repair, numbers[0], with_for_update=True)
         if repair is None:
             return await send(answer="Заявка не найдена")
         repair.director_viewed_at = repair.director_viewed_at or now()
         author = await session.get(User, repair.author_id)
         photo = await session.scalar(select(RepairPhoto).where(RepairPhoto.repair_id == repair.id))
-        card = director_card(repair, author, MOSCOW.key)
-        buttons = card["attachments"][0] if card["attachments"] else keyboard([])
-        buttons["payload"]["buttons"] += keyboard(
-            [[("⬅️ К списку", back)], [("🏠 Главное меню", "director:menu")]]
-        )["payload"]["buttons"]
+        card = director_card(repair, author, MOSCOW.key, context)
+        buttons = card["attachments"][0]
         reference = (
             None
             if photo is None
@@ -304,6 +312,7 @@ def parse_update(raw):
 
 
 async def reply(session, event, text=None, buttons=None, photo=None, *, answer=None):
+    buttons = buttons or (keyboard([]) if text is not None else None)
     body = {"text": text, "attachments": [buttons] if buttons else []}
     if event["callback_id"]:
         payload = {"callback_id": event["callback_id"]}
@@ -412,7 +421,7 @@ async def submit(session, user, draft, settings):
     return repair
 
 
-async def transition(session, repair, status, director_id, settings, reason=None):
+async def transition(session, repair, status, director_id, settings, reason=None, *, sync=True):
     repair.director_viewed_at = repair.director_viewed_at or now()
     if repair.status in ("done", "rejected") or repair.status == status:
         return False
@@ -433,15 +442,16 @@ async def transition(session, repair, status, director_id, settings, reason=None
         key=f"repair:{repair.id}:author:{status}",
         repair_id=repair.id,
         user_id=author.max_user_id,
-        payload={"text": messages[status]},
+        payload={"text": messages[status], "attachments": [keyboard([])]},
     )
-    await enqueue(
-        session,
-        key=f"repair:{repair.id}:sync:{status}",
-        kind="director_sync",
-        repair_id=repair.id,
-        chat_id=settings.director_chat_id,
-    )
+    if sync:
+        await enqueue(
+            session,
+            key=f"repair:{repair.id}:sync:{status}",
+            kind="director_sync",
+            repair_id=repair.id,
+            chat_id=settings.director_chat_id,
+        )
     return True
 
 
@@ -527,7 +537,16 @@ async def admin_callback(session, user, draft, event, send, settings):
             text = "Заявка отклонена." if changed else "Заявка уже закрыта."
             return await send(text, answer=text)
         return await send(answer="Действие недоступно")
-    if len(parts) != 3 or not parts[2].isdigit() or not 0 < int(parts[2]) < 2**63:
+    if (
+        len(parts) not in (3, 6)
+        or not all(value.isdigit() and 0 <= int(value) < 2**63 for value in parts[2:])
+        or int(parts[2]) == 0
+    ):
+        return await send(answer="Некорректная кнопка")
+    year, month, page = map(int, parts[3:]) if len(parts) == 6 else (0, 0, 0)
+    if not (
+        year == month == 0 or 2026 <= year <= now().astimezone(MOSCOW).year and 1 <= month <= 12
+    ):
         return await send(answer="Некорректная кнопка")
     repair = await session.get(Repair, int(parts[2]), with_for_update=True)
     if not repair or repair.status in ("done", "rejected"):
@@ -542,9 +561,25 @@ async def admin_callback(session, user, draft, event, send, settings):
         return await show_draft(draft, send, answer="Укажите причину")
     if parts[1] not in ("done", "pending"):
         return await send(answer="Неизвестное действие")
-    changed = await transition(session, repair, parts[1], event["user_id"], settings)
+    changed = await transition(
+        session,
+        repair,
+        parts[1],
+        event["user_id"],
+        settings,
+        sync=parts[1] != "done" or event["message_id"] != repair.director_message_id,
+    )
     if draft and draft.repair_id == repair.id and parts[1] == "done":
         await session.delete(draft)
+    if parts[1] == "done":
+        return await repair_list(
+            session,
+            send,
+            page,
+            year or None,
+            month or None,
+            prefix=f"✅ Заявка №{repair.id} выполнена.\n\n",
+        )
     await send(answer="Статус обновлён" if changed else "Статус уже установлен")
 
 
@@ -569,6 +604,10 @@ async def draft_message(session, draft, event, send, photos):
             draft.photo_ref = await photos.receive(event["attachments"][0])
         except InvalidPhoto as exc:
             return await show_draft(draft, send, f"{exc}\n")
+        except (httpx.HTTPError, OSError):
+            return await show_draft(
+                draft, send, "Не удалось сохранить фото. Пришлите изображение ещё раз.\n"
+            )
         field, limit, next_stage = None, None, "location"
     else:
         field = FIELDS[draft.stage]
@@ -615,7 +654,13 @@ async def route(session, event, settings, photos):
         if is_director(event["user_id"], settings)
         else None
     )
-    if event["kind"] == "bot_started" or event["text"].strip() == "/start":
+    if (
+        event["kind"] == "bot_started"
+        or event["text"].strip() == "/start"
+        or event["payload"] in ("menu", "found:home")
+        or event["payload"] == "director:menu"
+        and is_director(event["user_id"], settings)
+    ):
         suffix = ""
         if draft:
             draft.paused, draft.version = True, draft.version + 1
@@ -676,7 +721,7 @@ async def route(session, event, settings, photos):
     )
 
 
-def director_card(repair, author, timezone):
+def director_card(repair, author, timezone, context=None):
     created = repair.created_at.astimezone(ZoneInfo(timezone)).strftime("%d.%m.%Y %H:%M")
     text = (
         f"📋 Заявка №{repair.id}\n👤 Отправитель: {author.name}\n"
@@ -686,9 +731,15 @@ def director_card(repair, author, timezone):
     )
     if repair.rejection_reason:
         text += f"\nПричина отклонения: {repair.rejection_reason}"
-    buttons = []
+    rows = []
+    suffix = ":" + ":".join(map(str, context)) if context is not None else ""
     if repair.status not in ("done", "rejected"):
         actions = {"done": "✅ Выполнено", "pending": STATUS["pending"], "reject": "❌ Отклонить"}
-        rows = [[(label, f"admin:{action}:{repair.id}")] for action, label in actions.items()]
-        buttons = [keyboard(rows)]
-    return {"text": text, "attachments": buttons}
+        rows = [
+            [(label, f"admin:{action}:{repair.id}{suffix}")] for action, label in actions.items()
+        ]
+    if context is not None:
+        year, month, page = context
+        back = f"director:month:{year}:{month}:{page}" if year else f"director:inbox:{page}"
+        rows.append([("⬅️ К списку", back)])
+    return {"text": text, "attachments": [keyboard(rows)]}
